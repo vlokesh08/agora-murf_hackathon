@@ -1,0 +1,22 @@
+{
+  "name": "personal-automation-agent",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:backend": "npm run dev -w @personal-agent/backend",
+    "dev:web": "npm run dev -w desktop",
+    "dev:electron": "npm run electron:dev -w desktop",
+    "db:push": "npm run db:push -w @personal-agent/backend"
+  },
+  "allowScripts": {
+    "esbuild@0.18.20": true,
+    "esbuild@0.25.12": true,
+    "esbuild@0.28.2": true,
+    "fsevents@2.3.3": true
+  }
+}

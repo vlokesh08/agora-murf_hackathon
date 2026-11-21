@@ -1,0 +1,1028 @@
+---
+title: Personal Automation Agent — Development Blueprint
+description: Architecture and implementation plan for a voice-first macOS personal automation agent with Better Auth, persona modes, visual workflow execution, LangGraph, and Graphify.
+version: 1.1
+status: Draft
+platform: macOS
+---
+
+# Personal Automation Agent
+
+## Development Blueprint
+
+> **Product vision:** Build a voice-first personal automation assistant for macOS that understands natural-language requests, plans multi-step work, executes approved actions across connected applications, shows its reasoning process as an understandable visual workflow, and verifies the outcome.
+
+This document is the implementation guide for the project. It is intended to be used by developers and AI coding agents working in Cursor or similar tools. Treat it as the architectural source of truth, but verify library APIs and package installation instructions against their current official documentation before implementation.
+
+---
+
+## 1. Product goals
+
+The application should do more than answer questions. A user should be able to say:
+
+- “Check my calendar and find a free slot for a meeting tomorrow.”
+- “Find the latest email from Rahul and draft a reply.”
+- “Organize the PDFs in my Downloads folder into a new folder.”
+- “Prepare my day by summarizing meetings and important emails.”
+
+The assistant should:
+
+1. Understand the user's intent and relevant context.
+2. Create a structured plan with ordered steps and dependencies.
+3. Explain what it is about to do in plain language.
+4. Execute read-only steps and other permitted operations.
+5. Pause for approval before actions that require confirmation.
+6. Recover from errors or unavailable services where possible.
+7. Verify the actual result in the external service or local system.
+8. Summarize what was completed and what could not be completed.
+
+### Core principles
+
+- Voice-first, with text input as an equal fallback.
+- Transparent execution: the user can inspect the plan and live progress.
+- Human control: approvals and cancellation are first-class features.
+- Safe-by-default access to local files, apps and external services.
+- One orchestrator initially; add specialist agents only when justified.
+- Persistent user preferences and resumable workflow state.
+- A modular tool system that can grow through custom tools and MCP.
+
+## 2. Confirmed technology stack
+
+| Layer | Technology | Responsibility |
+|---|---|---|
+| Desktop shell | Electron | macOS windows, lifecycle, native capabilities |
+| UI | React + TypeScript | Desktop interface |
+| Components | beUI | UI components and animation building blocks |
+| Styling | Tailwind CSS | Styling and layout |
+| Backend | Node.js + Express + TypeScript | APIs and application services |
+| Authentication | Better Auth | Sign-in, sessions and account management |
+| Database | PostgreSQL | Application persistence |
+| ORM | Drizzle ORM | Typed database access and migrations |
+| Agent orchestration | LangGraph.js | Planning, state transitions, approvals and recovery |
+| LLM | Provider adapter for OpenAI, Gemini or Claude | Intent understanding and structured decisions |
+| Tool integration | MCP + custom TypeScript tools | External and local capabilities |
+| Real-time UI | Socket.IO | Live agent and workflow events |
+| Voice | Agora + Murf | Real-time audio and speech output |
+| Codebase context | Graphify | Development-time code knowledge graph |
+
+Do not tightly couple the application to one LLM provider. Define a provider interface and keep model selection configurable.
+
+---
+
+## 3. Product experience and main screens
+
+### 3.1 Onboarding
+
+On first launch, guide the user through a short setup:
+
+1. Welcome and explain what the assistant can do.
+2. Ask the user to choose a communication/personality mode.
+3. Allow the user to connect integrations such as Google Calendar and Gmail.
+4. Explain permissions and approval defaults.
+5. Test microphone access and optionally configure voice output.
+6. Finish at the main assistant screen.
+
+**Mode selection must happen during onboarding**, as requested. The user should be able to change the mode later in Settings. Do not ask the mode question on every conversation.
+
+### 3.2 Main assistant screen
+
+Suggested layout:
+
+- Sidebar: New conversation, History, Automations, Connected apps and Settings.
+- Main conversation area: user and assistant messages, voice orb and text composer.
+- Agent status: concise current state such as “Understanding request”, “Planning”, “Waiting for approval” or “Verifying”.
+- Workflow button: a clear **Show workflow** button beneath or near the active assistant response.
+- Optional activity summary: the current step and progress count.
+
+The main screen should remain approachable. Do not display a dense technical graph by default while the user is simply talking to the assistant.
+
+### 3.3 Workflow view
+
+When the user selects **Show workflow**, open an expanded workflow canvas inspired by node-based automation builders such as n8n.
+
+The canvas should show nodes and connections representing the current run:
+
+- User request
+- Context retrieval
+- Planning
+- Tool/action nodes (for example Calendar: Find Events)
+- Decision/condition nodes
+- Approval nodes
+- Retry or recovery nodes
+- Verification nodes
+- Final response
+
+Each node should show a meaningful status:
+
+- Queued
+- Running
+- Completed
+- Waiting for approval
+- Failed
+- Skipped
+- Cancelled
+
+Selecting a node should open a detail panel containing a user-safe description, start/end time, duration, input/output summary, and any error or approval details. Redact credentials and sensitive payloads.
+
+**Important:** This is a visualization of the actual backend execution graph, not a decorative animation. The frontend must render events and node data emitted by the backend. Never fabricate completed steps or show a node as successful before the corresponding operation and verification have succeeded.
+
+### 3.4 Conversation and voice states
+
+Represent voice interaction states clearly:
+
+- Idle
+- Listening
+- Transcribing / understanding
+- Planning
+- Executing
+- Speaking
+- Interrupted
+- Reconnecting
+- Error
+
+Allow the user to interrupt speech, stop a run where safe, switch to text, and open the workflow view at any point.
+
+---
+
+## 4. Assistant personality modes
+
+The assistant should offer selectable modes during onboarding. A mode changes the assistant's communication style, not its authority, permissions, tool access or safety rules.
+
+### 4.1 Initial modes
+
+| Mode | Personality | Example behavior |
+|---|---|---|
+| Professional | Clear, concise, respectful and structured | “Your 2:30 PM slot is available. Shall I schedule the meeting?” |
+| Roast Mode | Playfully sarcastic, witty and lightly teasing | “Your calendar is a mess, but I found a free slot at 2:30. Want me to fix it?” |
+| Family Touch | Warm, patient, supportive and considerate | “You have a little free time after lunch. I can arrange the meeting then if you'd like.” |
+
+Names and descriptions can be refined during UI design. Consider an optional “Balanced” or “Friendly” default if user testing shows that three stronger personalities are too restrictive.
+
+### 4.2 Mode selection UX
+
+During onboarding, present three selectable cards with:
+
+- Mode name
+- Short description
+- Example assistant response
+- Selected state
+
+Require one selection to continue, but provide a sensible default (Professional or Balanced) so onboarding cannot become blocked. Persist the selected mode in the user's settings.
+
+Settings should later allow changing the mode without losing conversation history.
+
+### 4.3 Mode implementation
+
+Store a stable mode key, not an entire editable system prompt, as the user's preference:
+
+```ts
+export type AssistantMode =
+  | "professional"
+  | "roast"
+  | "family";
+```
+
+Create a server-side mode configuration:
+
+```ts
+export const assistantModes = {
+  professional: {
+    label: "Professional",
+    tone: "Clear, concise, respectful and structured.",
+  },
+  roast: {
+    label: "Roast Mode",
+    tone: "Witty and playfully sarcastic. Keep teasing light and friendly.",
+  },
+  family: {
+    label: "Family Touch",
+    tone: "Warm, patient, supportive and considerate.",
+  },
+} as const;
+```
+
+Inject the selected tone into the response-generation layer. Keep the agent's operational instructions separate from personality instructions.
+
+**Non-negotiable rule:** Roast Mode must never insult protected traits, use hateful language, bully the user, or trivialize emergencies. Family Touch must not become patronizing. All modes must communicate risks, approvals, failures and confirmations accurately. Personality must never override tool permissions or approval requirements.
+
+---
+
+## 5. High-level architecture
+
+```text
+Electron macOS Application
+  ├── React Renderer (beUI)
+  │    ├── Conversation UI
+  │    ├── Voice Controls
+  │    ├── Mode-aware Responses
+  │    ├── Show Workflow Button
+  │    └── Node-based Workflow Canvas
+  │
+  ├── Preload (restricted IPC bridge)
+  └── Main Process (window and native lifecycle)
+            |
+            | HTTPS / Socket.IO
+            v
+Express + TypeScript Backend
+  ├── Better Auth
+  ├── REST API
+  ├── Socket.IO Gateway
+  ├── Conversation Service
+  ├── LangGraph Runtime
+  │    ├── Context Loader
+  │    ├── Planner
+  │    ├── Policy / Approval Gate
+  │    ├── Tool Executor
+  │    ├── Recovery Handler
+  │    └── Verification
+  ├── MCP Client / Tool Registry
+  └── Integration Services
+            |
+            +---- PostgreSQL + Drizzle
+            +---- LLM Provider
+            +---- Google Calendar / Gmail / other services
+            +---- Agora / Murf
+            +---- Permission-scoped local tools
+```
+
+Keep Electron renderer, Electron main process and backend responsibilities separate. The renderer must not have unrestricted Node.js access. The backend is responsible for authorization, tool policy and execution.
+
+---
+
+## 6. Repository structure
+
+Use a monorepo:
+
+```text
+personal-automation-agent/
+├── apps/
+│   ├── desktop/
+│   │   ├── electron/
+│   │   │   ├── main.ts
+│   │   │   ├── preload.ts
+│   │   │   └── ipc/
+│   │   └── src/
+│   │       ├── components/
+│   │       ├── features/
+│   │       │   ├── onboarding/
+│   │       │   ├── conversations/
+│   │       │   ├── voice/
+│   │       │   ├── workflow-canvas/
+│   │       │   ├── approvals/
+│   │       │   ├── automations/
+│   │       │   └── settings/
+│   │       ├── hooks/
+│   │       ├── services/
+│   │       ├── stores/
+│   │       ├── layouts/
+│   │       └── App.tsx
+│   │
+│   └── backend/
+│       └── src/
+│           ├── app.ts
+│           ├── server.ts
+│           ├── auth/
+│           ├── config/
+│           ├── routes/
+│           ├── controllers/
+│           ├── middleware/
+│           ├── agents/
+│           ├── workflows/
+│           ├── tools/
+│           ├── mcp/
+│           ├── integrations/
+│           ├── services/
+│           ├── events/
+│           ├── database/
+│           ├── validators/
+│           └── types/
+│
+├── packages/
+│   └── shared/
+│       ├── types/
+│       ├── schemas/
+│       └── constants/
+├── docs/
+│   ├── PROJECT_OVERVIEW.mdx
+│   ├── ARCHITECTURE.mdx
+│   ├── AUTHENTICATION.mdx
+│   ├── ASSISTANT_MODES.mdx
+│   ├── WORKFLOW_VISUALIZATION.mdx
+│   ├── AGENT_DESIGN.mdx
+│   ├── DATABASE_SCHEMA.mdx
+│   ├── TOOL_INTEGRATION.mdx
+│   ├── VOICE_INTEGRATION.mdx
+│   ├── GRAPHIFY_SETUP.mdx
+│   ├── SECURITY.mdx
+│   └── DEVELOPMENT_ROADMAP.mdx
+├── graphify-out/
+├── .graphifyrc
+├── .graphifyignore
+├── .env.example
+├── package.json
+└── README.md
+```
+
+---
+
+## 7. Authentication with Better Auth
+
+Use Better Auth for authentication and session management. The backend remains the authority for access control.
+
+### Requirements
+
+- Sign up and sign in.
+- Sign out.
+- Session persistence across desktop restarts, subject to secure storage and session expiry.
+- Account/profile management.
+- Protected API routes.
+- User-scoped conversations, preferences, integrations and runs.
+- Secure account/session handling in the Electron environment.
+
+### Integration approach
+
+1. Configure Better Auth in the Express backend using its documented Express integration and PostgreSQL adapter.
+2. Use Drizzle with the schema requirements supported by the selected Better Auth version.
+3. Mount Better Auth's handler at the documented auth route.
+4. Add backend middleware/helpers to resolve the authenticated user for protected routes.
+5. Scope every database query and Socket.IO room to the authenticated user.
+6. Ensure the Electron client uses the correct cookie/session transport for the chosen desktop architecture.
+7. Test session restoration, expiry, logout and unauthorized access.
+
+Do not invent a custom authentication protocol around Better Auth. Follow its current official documentation for the installed version, including cookie, origin, CORS and trusted-origin configuration.
+
+### Electron security considerations
+
+- Do not expose session secrets or Better Auth internals to the renderer.
+- Use a secure, restricted preload bridge.
+- Configure allowed origins deliberately for development and production.
+- Avoid logging cookies, authorization headers or tokens.
+- Store any required long-lived desktop credential using macOS Keychain or an appropriate secure mechanism.
+- Never store passwords or raw OAuth tokens in localStorage.
+
+### Authentication versus integration connections
+
+Better Auth authenticates the user to this application. Google OAuth or another provider's OAuth flow separately grants the application permission to access that provider. Do not treat signing into the desktop app as automatic authorization to read Gmail or Calendar.
+
+---
+
+## 8. Database design
+
+Use PostgreSQL and Drizzle ORM. Start with these logical tables; finalize columns and relations during the schema phase.
+
+| Table | Purpose |
+|---|---|
+| user / Better Auth tables | Accounts, sessions, identities and verification data required by Better Auth |
+| user_preferences | Assistant mode, voice and application preferences |
+| conversations | Conversation metadata and ownership |
+| messages | User and assistant messages |
+| integrations | Connected provider metadata and scopes |
+| credentials | Encrypted credential material or secure references, if required |
+| agent_runs | One execution of an agent request |
+| workflow_nodes | Node definitions and execution state for a run |
+| workflow_edges | Dependency/connection data for visual workflow rendering |
+| execution_steps | Detailed step lifecycle and results |
+| tool_executions | Tool invocation metadata and sanitized results |
+| approvals | Approval requests, decisions and timestamps |
+| automations | Saved/reusable automation definitions |
+| automation_runs | Executions of saved automations |
+| memories | Explicitly scoped user preferences or useful context |
+
+### Data rules
+
+- Use UUID identifiers and timestamps.
+- Add foreign keys and indexes for user ownership and run lookups.
+- Persist workflow status transitions.
+- Store sanitized tool input/output summaries, not secrets.
+- Use idempotency keys for actions that could be retried.
+- Keep LangGraph checkpoint storage logically distinct from application conversation history.
+- Encrypt sensitive credentials or store them in Keychain and persist only references where practical.
+- Define retention and deletion behavior for conversation content, logs and workflow payloads.
+
+---
+
+## 9. Agent orchestration with LangGraph.js
+
+Begin with one orchestrator graph. The graph should be explicit and observable.
+
+### Suggested graph stages
+
+1. `receive_request` — validate and normalize the request.
+2. `load_context` — retrieve conversation, preferences and relevant integration context.
+3. `plan` — create structured steps and dependencies.
+4. `validate_plan` — validate tools, schemas, permissions and policy.
+5. `execute_read_steps` — perform allowed read-only operations.
+6. `approval_gate` — pause for user confirmation where required.
+7. `execute_write_steps` — perform approved state-changing operations.
+8. `recover` — handle retryable failures or find safe alternatives.
+9. `verify` — check the external state.
+10. `respond` — summarize outcome using the selected personality mode.
+
+Use LangGraph state, conditional edges and checkpointing to support resumable execution and human-in-the-loop pauses. The user-facing workflow view should be derived from these real graph transitions and tool lifecycle events.
+
+### Example plan
+
+User: “Find a free slot tomorrow, schedule a meeting with Rahul and email him.”
+
+```json
+{
+  "goal": "Schedule a meeting with Rahul",
+  "steps": [
+    { "id": "s1", "tool": "calendar.list_events", "kind": "read" },
+    { "id": "s2", "tool": "calendar.find_free_slots", "dependsOn": ["s1"], "kind": "read" },
+    { "id": "s3", "tool": "calendar.create_event", "dependsOn": ["s2"], "kind": "write", "approvalRequired": true },
+    { "id": "s4", "tool": "email.send_message", "dependsOn": ["s3"], "kind": "write", "approvalRequired": true },
+    { "id": "s5", "tool": "calendar.verify_event", "dependsOn": ["s3"], "kind": "verify" },
+    { "id": "s6", "tool": "email.verify_sent", "dependsOn": ["s4"], "kind": "verify" }
+  ]
+}
+```
+
+This is illustrative. The planner must collect missing details (duration, attendee identity, time zone, message content) rather than invent them.
+
+---
+
+## 10. Workflow visualization — n8n-inspired canvas
+
+This is a key product feature, not merely a debug screen.
+
+### User experience
+
+After a voice or text request:
+
+1. Show the assistant's short acknowledgement.
+2. Show a compact status such as “Planning your request”.
+3. Display a **Show workflow** button below the response.
+4. The user can open the workflow canvas while the run is in progress or after it completes.
+5. The canvas updates as backend events arrive.
+6. Selecting a node reveals details and available actions.
+
+The workflow canvas should be inspired by n8n's node-based interaction model, but use original styling and the project's own node types. Evaluate a React node-editor library such as React Flow / `@xyflow/react` for rendering, panning, zooming, connections and custom nodes. Verify current licensing and compatibility before adoption.
+
+### Node types
+
+- `trigger`: user request / voice input.
+- `context`: memory or application context retrieval.
+- `agent`: planning or reasoning stage, represented with a safe summary rather than hidden chain-of-thought.
+- `tool`: external API or local capability invocation.
+- `condition`: branching decision.
+- `approval`: user confirmation required.
+- `retry`: retry or recovery path.
+- `verification`: independent check of the result.
+- `result`: final outcome.
+
+### Node data contract
+
+Define a shared frontend/backend type, for example:
+
+```ts
+export type WorkflowNodeStatus =
+  | "queued"
+  | "running"
+  | "waiting_approval"
+  | "completed"
+  | "failed"
+  | "skipped"
+  | "cancelled";
+
+export interface WorkflowNodeView {
+  id: string;
+  runId: string;
+  type: string;
+  title: string;
+  description: string;
+  status: WorkflowNodeStatus;
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
+  safeInputSummary?: Record<string, unknown>;
+  safeOutputSummary?: Record<string, unknown>;
+  errorSummary?: string;
+  approvalId?: string;
+}
+
+export interface WorkflowEdgeView {
+  id: string;
+  source: string;
+  target: string;
+  label?: string;
+}
+```
+
+The exact contract should be refined and validated with Zod in `packages/shared`.
+
+### Live event flow
+
+The backend emits events such as:
+
+```text
+agent:run_started
+workflow:node_created
+workflow:node_started
+workflow:node_completed
+workflow:node_failed
+workflow:approval_required
+workflow:approval_resolved
+workflow:run_completed
+workflow:run_failed
+```
+
+Each event should include `runId`, `conversationId`, event ID, timestamp and a sanitized payload. Use event IDs or sequence numbers so the client can detect missed events and reload the current run snapshot.
+
+### Important visualization rules
+
+- A node becomes completed only after its operation has completed; verification nodes must independently report verification results.
+- Show approval nodes as waiting until the user decides.
+- Render failed and recovery branches honestly.
+- Show dependencies and parallel branches where they exist.
+- Do not expose hidden chain-of-thought. Show concise rationale, plan summaries, tool names, progress and outcomes instead.
+- Provide a readable list/timeline alternative for accessibility and smaller windows.
+- Let the user cancel a run where cancellation is safe; explain if an already-submitted external action cannot be undone.
+
+---
+
+## 11. Tools and MCP integrations
+
+Tools are the only supported way for the agent to perform operations.
+
+### Initial tool groups
+
+**Calendar**
+
+- `calendar.list_events`
+- `calendar.find_free_slots`
+- `calendar.create_event`
+- `calendar.update_event`
+- `calendar.delete_event`
+
+**Email**
+
+- `email.search_messages`
+- `email.read_message`
+- `email.draft_message`
+- `email.send_message`
+
+**Filesystem**
+
+- `filesystem.list_directory`
+- `filesystem.search_files`
+- `filesystem.read_file`
+- `filesystem.create_directory`
+- `filesystem.move_file`
+- `filesystem.rename_file`
+
+**Tasks**
+
+- `tasks.create`
+- `tasks.list`
+- `tasks.update`
+- `tasks.complete`
+
+### Tool contract
+
+Every tool must define:
+
+- Stable name and description.
+- Zod input and output schemas.
+- Required integration scopes or local permissions.
+- Read/write/destructive classification.
+- Approval policy.
+- Timeout and retry policy.
+- Idempotency behavior.
+- Verification method.
+- Sanitized event summaries.
+
+Do not expose arbitrary shell execution as a general-purpose tool. Restrict filesystem operations to user-approved directories, validate paths and defend against path traversal and symlink escapes.
+
+### MCP strategy
+
+Use MCP when it provides a useful standardized integration. Use custom TypeScript tools when tighter control, special approval rules or better verification are needed. Treat MCP tool descriptions and outputs as untrusted data; validate arguments and results before use. The application's MCP connections to external services are separate from Graphify's MCP integration for coding agents.
+
+---
+
+## 12. Voice architecture
+
+Keep voice transport separate from agent orchestration.
+
+```text
+Microphone
+   -> Electron / Agora RTC
+   -> speech recognition or Agora conversational pipeline
+   -> backend request / LangGraph run
+   -> assistant response
+   -> Murf speech generation (where applicable)
+   -> audio playback
+```
+
+Confirm the exact supported Agora Conversational AI and Murf Falcon integration model during implementation. Do not assume every provider combination can be chained in the same way; validate SDK support, streaming behavior, latency and interruption support.
+
+Requirements:
+
+- Microphone permission handling.
+- Start/stop listening.
+- Voice activity and listening indicator.
+- Transcript display and correction path.
+- Interrupt assistant speech.
+- Reconnection and provider failure handling.
+- Text fallback.
+- Backend-generated short-lived provider tokens where required.
+- No provider secrets in the renderer.
+
+---
+
+## 13. Better Auth and application identity
+
+Better Auth handles identity and sessions for the desktop application. Provider OAuth (for example Google Calendar/Gmail) is a separate authorization flow.
+
+### Required flows
+
+- Sign up / sign in.
+- Restore session on app launch.
+- Sign out.
+- Handle expired sessions.
+- Protect backend APIs.
+- Scope conversations, preferences, integrations and runs by authenticated user.
+- Secure Socket.IO handshake and room membership.
+
+Use the current Better Auth Express and Drizzle documentation for the exact setup. Verify Electron cookie handling, trusted origins, CORS and session transport in both development and packaged builds.
+
+---
+
+## 14. Real-time API and Socket.IO
+
+Use REST for durable operations and Socket.IO for live updates.
+
+### REST endpoint examples
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| POST | `/api/conversations` | Create conversation |
+| GET | `/api/conversations` | List conversations |
+| GET | `/api/conversations/:id` | Fetch conversation |
+| POST | `/api/agent/runs` | Start agent run |
+| GET | `/api/agent/runs/:runId` | Fetch run snapshot |
+| GET | `/api/agent/runs/:runId/workflow` | Fetch workflow graph |
+| POST | `/api/approvals/:approvalId/approve` | Approve action |
+| POST | `/api/approvals/:approvalId/reject` | Reject action |
+| GET | `/api/integrations` | List integrations |
+| PATCH | `/api/preferences` | Update user preferences/mode |
+
+### Socket.IO events
+
+- `agent:run_started`
+- `agent:status_changed`
+- `workflow:node_created`
+- `workflow:node_started`
+- `workflow:node_completed`
+- `workflow:node_failed`
+- `workflow:approval_required`
+- `workflow:approval_resolved`
+- `agent:run_completed`
+- `agent:run_failed`
+
+Authenticate the socket connection and authorize access to each run. Never trust a client-supplied run ID without checking ownership.
+
+---
+
+## 15. Memory and persistence
+
+Keep three concepts distinct:
+
+1. **Conversation context:** messages and current conversation state.
+2. **User memory/preferences:** user-approved preferences and useful recurring context.
+3. **Workflow checkpoint:** execution state needed to resume an interrupted LangGraph run.
+
+PostgreSQL is the primary application database. Use a PostgreSQL-compatible LangGraph checkpointer. Do not assume checkpoint storage replaces application messages, run history or audit records.
+
+Start with relational retrieval. Add embeddings/vector search only when a real semantic-retrieval requirement exists.
+
+---
+
+## 16. Graphify — development-time codebase context
+
+Repository: https://github.com/Graphify-Labs/graphify
+
+Graphify should help coding agents understand the structure and relationships in this repository. It is not the runtime memory system for the personal assistant.
+
+### Responsibilities
+
+- Build a graph of code and supported project artifacts.
+- Help identify dependencies and related modules.
+- Support impact analysis before changes.
+- Let coding agents query relationships through supported integrations.
+- Keep architecture and source-code context easier to navigate as the repository grows.
+
+### Setup
+
+Follow the current official Graphify README and installation instructions. The project has used the `graphifyy` package name with a `graphify` CLI; verify the current package, extras and commands before running them:
+
+```bash
+uv tool install graphifyy
+graphify install
+```
+
+Generate or update the graph using the command documented by the installed version. Do not hard-code a slash command or CLI syntax into automation until verified against the installed release.
+
+### Exclusions
+
+Exclude generated output, dependencies, build artifacts, secrets, local databases, logs and private user data. Review `.gitignore`, `.graphifyignore` and Graphify configuration behavior.
+
+Example exclusions to adapt to the actual syntax:
+
+```text
+node_modules/
+dist/
+build/
+coverage/
+.env
+.env.*
+*.log
+*.sqlite
+*.db
+graphify-out/
+```
+
+### Graphify workflow for coding agents
+
+Before significant implementation:
+
+1. Query Graphify for related modules and dependencies.
+2. Read the actual source files and docs.
+3. Identify affected interfaces and tests.
+4. Propose a small implementation plan.
+5. Implement the change.
+6. Run type checks and tests.
+7. Update the graph if needed.
+8. Inspect affected relationships again.
+
+Graphify is a navigation aid, not a correctness guarantee. Verify findings against source code.
+
+---
+
+## 17. Security and approval policy
+
+### Electron
+
+- Enable context isolation.
+- Disable Node integration in the renderer.
+- Use a minimal preload API.
+- Validate IPC payloads.
+- Apply a restrictive Content Security Policy.
+- Do not expose arbitrary filesystem, shell or process APIs to React.
+
+### Backend and integrations
+
+- Validate every API and tool input.
+- Enforce user ownership and integration scopes.
+- Keep credentials out of logs and renderer state.
+- Encrypt secrets or use macOS Keychain where appropriate.
+- Use short-lived tokens where supported.
+- Apply rate limits and timeouts.
+- Redact personal information in workflow event payloads.
+
+### Initial approval defaults
+
+| Action | Initial policy |
+|---|---|
+| Read calendar | Allowed after provider authorization |
+| Search/read email | Allowed after provider authorization |
+| Draft email | No send approval required; user reviews draft |
+| Send email | Approval required |
+| Create calendar event | Approval required initially |
+| Delete calendar event | Approval required |
+| Read files | Only within granted directories |
+| Move/rename files | Approval required initially |
+| Delete files | Always require explicit approval |
+| Arbitrary shell command | Disabled by default |
+
+Approval must be bound to the exact operation and parameters. If those parameters change, ask for approval again.
+
+---
+
+## 18. Reliability and recovery
+
+Handle:
+
+- Network interruptions.
+- Provider rate limits.
+- Expired OAuth grants.
+- Missing permissions.
+- Invalid tool arguments.
+- Tool timeouts.
+- Duplicate requests.
+- Partial completion.
+- User rejection or cancellation.
+- App restart during a workflow.
+
+Use bounded retries with exponential backoff for transient failures, idempotency keys for retriable writes, checkpoints for resumability and independent verification. Never blindly retry non-idempotent operations such as sending email or creating events without checking whether the first attempt succeeded.
+
+---
+
+## 19. Testing strategy
+
+### Unit tests
+
+- Mode configuration and prompt composition.
+- Planner schema validation.
+- Tool input validation.
+- Approval policy.
+- Workflow state transitions.
+- Permission checks.
+- Database services.
+
+### Integration tests
+
+- Better Auth with Express and PostgreSQL.
+- Drizzle migrations and queries.
+- LangGraph checkpoint persistence.
+- Tool execution and verification.
+- Socket.IO authentication and event delivery.
+- Provider OAuth and token refresh.
+
+### End-to-end scenarios
+
+**Scenario A — Calendar scheduling**
+
+1. User asks to schedule a meeting.
+2. Agent checks availability.
+3. Agent proposes a slot.
+4. Workflow canvas shows the plan and tool nodes.
+5. User approves event creation.
+6. Agent creates and verifies the event.
+7. Assistant confirms completion in the selected mode.
+
+**Scenario B — Email draft**
+
+1. User asks to find an email and draft a reply.
+2. Agent searches and reads the matching message.
+3. Agent prepares a draft.
+4. UI shows the draft for review.
+5. Sending requires approval.
+6. Agent verifies the sent message if approved.
+
+**Scenario C — File organization**
+
+1. User asks to organize PDFs in Downloads.
+2. Agent inspects only the permitted directory.
+3. Agent displays proposed moves in the workflow.
+4. User approves.
+5. Agent moves files and verifies destinations.
+
+**Scenario D — Personality modes**
+
+Run the same harmless request in Professional, Roast and Family Touch modes. Verify tone changes while tool selection, approval policy and factual results remain identical.
+
+---
+
+## 20. Development roadmap
+
+### Phase 1 — Foundation
+
+- Create monorepo.
+- Configure Electron + React + TypeScript.
+- Configure beUI and Tailwind.
+- Create Express backend.
+- Configure PostgreSQL and Drizzle.
+- Add shared types and Zod schemas.
+- Add linting, formatting and tests.
+
+**Deliverable:** Desktop app connected to the backend and database.
+
+### Phase 2 — Authentication and onboarding
+
+- Integrate Better Auth.
+- Implement sign-in/sign-up and session handling.
+- Build onboarding.
+- Add Professional, Roast Mode and Family Touch selection.
+- Persist selected mode.
+- Add Settings mode switcher.
+
+**Deliverable:** Authenticated desktop experience with persistent assistant personality.
+
+### Phase 3 — UI and workflow visualization
+
+- Build conversation UI.
+- Add voice controls and state indicators.
+- Add Show workflow button.
+- Build node-based canvas and node detail panel.
+- Add list/timeline fallback.
+- Connect mock workflow events first.
+
+**Deliverable:** Interactive UI that can display a simulated workflow accurately.
+
+### Phase 4 — Backend and agent runtime
+
+- Implement API modules.
+- Integrate LangGraph.js.
+- Define agent state and graph nodes.
+- Implement planner and tool registry.
+- Add approval interrupts.
+- Add PostgreSQL checkpointing.
+- Emit real Socket.IO workflow events.
+
+**Deliverable:** Multi-step agent workflow with live visualization and approval.
+
+### Phase 5 — First real integrations
+
+- Google OAuth connection.
+- Calendar read/search/create.
+- Gmail search/read/draft/send.
+- Approval and verification.
+- Error handling and idempotency.
+
+**Deliverable:** At least two coordinated external services.
+
+### Phase 6 — Voice
+
+- Integrate Agora RTC/conversational capabilities.
+- Add speech recognition/transcription path.
+- Integrate Murf speech output.
+- Add interruption and reconnect handling.
+- Keep text fallback.
+
+**Deliverable:** Voice-first end-to-end automation.
+
+### Phase 7 — macOS tools and polish
+
+- Add permission-scoped filesystem tools.
+- Add macOS notifications.
+- Add background execution behavior where appropriate.
+- Add recovery and audit views.
+- Package and test macOS builds.
+
+**Deliverable:** Reliable desktop MVP.
+
+---
+
+## 21. Definition of done for the MVP
+
+The first meaningful release is complete when:
+
+- User can sign in securely using Better Auth.
+- User selects a personality mode during onboarding and can change it later.
+- User can speak or type a request.
+- Agent creates a structured multi-step plan.
+- User can open a node-based workflow view with a Show workflow button.
+- Workflow nodes reflect actual backend execution states.
+- Agent can use at least two external tools/services.
+- Sensitive operations require explicit approval.
+- User can inspect errors and outcomes.
+- Agent verifies completed actions.
+- Conversations and execution history persist.
+- Interrupted workflows can recover where safe.
+- The app can be packaged and run on macOS.
+
+---
+
+## 22. Instructions for AI coding agents
+
+Use this document as the high-level implementation guide. Do not attempt to implement the entire product in one pass.
+
+Before coding:
+
+1. Inspect the existing repository and current docs.
+2. Use Graphify, if installed and generated, to find related code and dependencies.
+3. Read actual source files; Graphify output alone is not sufficient.
+4. Identify the current phase and scope.
+5. Propose a small plan and list files expected to change.
+6. Ask for clarification only when an essential product or security decision is missing.
+
+While coding:
+
+- Follow existing project conventions.
+- Use TypeScript and shared Zod schemas.
+- Keep UI, API, agent, tools and integrations separated.
+- Do not place secrets in the renderer.
+- Do not bypass approval policies.
+- Do not expose hidden chain-of-thought in the workflow UI.
+- Do not claim a tool action succeeded until verified.
+- Add tests for meaningful behavior.
+
+After coding:
+
+- Run lint, type checks and relevant tests.
+- Summarize implementation and known limitations.
+- Update relevant documentation.
+- Update Graphify's graph when appropriate.
+
+### First implementation task
+
+Start with **Phase 1 only**. Scaffold the monorepo, Electron desktop shell, React app, Express server, PostgreSQL connection, Drizzle setup and shared package. Do not implement the full agent, voice system or external integrations until the foundation is running and tested.
+
+---
+
+## 23. Architectural summary
+
+- **Electron** provides the macOS desktop shell.
+- **React + beUI** provide the interface.
+- **Better Auth** manages application identity and sessions.
+- **Express** exposes backend APIs and real-time services.
+- **PostgreSQL + Drizzle** persist application data.
+- **LangGraph.js** orchestrates agent execution and resumable workflows.
+- **MCP and custom tools** provide controlled capabilities.
+- **Agora + Murf** provide voice interaction.
+- **Graphify** gives coding agents structural context about the repository.
+- **Assistant modes** customize tone without changing safety or permissions.
+- **Workflow canvas** makes actual execution understandable and inspectable.
+
+> The LLM proposes and reasons about what should happen; the orchestrator controls the workflow; validated tools perform actions; approval gates preserve user control; verification establishes what actually happened; and the UI communicates the process honestly.
