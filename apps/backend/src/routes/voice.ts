@@ -1,4 +1,4 @@
-import { Router, type Response } from "express";
+import express, { Router, type Response } from "express";
 import { and, desc, eq } from "drizzle-orm";
 import type { AssistantMode } from "@personal-agent/shared";
 import { requireAuth } from "../middleware/requireAuth";
@@ -355,6 +355,68 @@ voiceRouter.post("/llm", async (req, res) => {
 });
 
 voiceRouter.use(requireAuth);
+
+// Whisper transcription for voice mode's mic. The browser's own Web Speech API
+// was unreliable here (Electron ships no speech backend of its own, so it
+// either never produced final results or transcribed background noise), which
+// is why the assistant stayed silent while the user talked. Recording one
+// utterance and transcribing it server-side is deterministic, and lets the
+// client drop quiet background noise before it is ever sent.
+const AUDIO_CONTENT_TYPES = [
+  "audio/webm",
+  "audio/ogg",
+  "audio/mp4",
+  "audio/wav",
+  "audio/mpeg",
+  "audio/x-m4a",
+  "application/octet-stream",
+];
+
+voiceRouter.post(
+  "/transcribe",
+  express.raw({ type: AUDIO_CONTENT_TYPES, limit: "15mb" }),
+  async (req, res) => {
+    if (!env.groqApiKey) {
+      res.status(501).json({ error: "GROQ_API_KEY is not configured on this server" });
+      return;
+    }
+    const audio = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    if (audio.length === 0) {
+      res.status(400).json({ error: "No audio received" });
+      return;
+    }
+    try {
+      const form = new FormData();
+      const bytes = audio.buffer.slice(
+        audio.byteOffset,
+        audio.byteOffset + audio.byteLength
+      ) as ArrayBuffer;
+      form.append(
+        "file",
+        new Blob([bytes], { type: req.headers["content-type"] ?? "audio/webm" }),
+        "speech.webm"
+      );
+      form.append("model", "whisper-large-v3-turbo");
+      form.append("language", "en");
+      form.append("response_format", "json");
+      const groqRes = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.groqApiKey}` },
+        body: form,
+      });
+      if (!groqRes.ok) {
+        console.error("[voice/transcribe] Groq error", groqRes.status, await groqRes.text());
+        res.status(502).json({ error: "Transcription failed" });
+        return;
+      }
+      const data = (await groqRes.json()) as { text?: string };
+      res.json({ text: (data.text ?? "").trim() });
+    } catch (err) {
+      console.error("[voice/transcribe] failed", err);
+      res.status(502).json({ error: "Transcription failed" });
+    }
+  }
+);
 
 voiceRouter.post("/session/start", async (req, res) => {
   if (!isAgoraConfigured()) {

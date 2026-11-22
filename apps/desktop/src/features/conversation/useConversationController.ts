@@ -56,6 +56,9 @@ export function useConversationController() {
   >(null);
   const [outputDevices, setOutputDevices] = useState<MediaDeviceInfo[]>([]);
   const [outputDeviceId, setOutputDeviceId] = useState("");
+  const [voiceMode, setVoiceMode] = useState<"convoai" | "hybrid" | null>(null);
+  const [voiceWarning, setVoiceWarning] = useState<string | null>(null);
+  const [micLevel, setMicLevel] = useState(0);
 
   const activeRunIdRef = useRef<string | null>(null);
   const voiceActiveRef = useRef(false);
@@ -92,6 +95,16 @@ export function useConversationController() {
       void voice.stop();
     },
     onAgentAudio: (speaking) => setVoiceState(speaking ? "speaking" : "listening"),
+    // Which pipeline actually started, and why it fell back — shown in the
+    // UI instead of only the console, so "it just sits there" is diagnosable.
+    onMode: (mode, warning) => {
+      setVoiceMode(mode);
+      setVoiceWarning(warning ?? null);
+    },
+    // Recoverable: say what went wrong but keep the session listening.
+    onWarning: (message) => setVoiceError(message),
+    onMicLevel: (level) =>
+      setMicLevel((current) => (Math.abs(current - level) > 0.03 ? level : current)),
     // Mic is paused here (push-to-talk, one utterance captured) — the
     // session itself stays active; listening resumes once the assistant's
     // reply has actually finished, via `backToListening()` below, so a
@@ -236,7 +249,14 @@ export function useConversationController() {
     }
     function onFailed(envelope: SocketEventEnvelope<{ error?: string }>) {
       if (!isActive(envelope)) return;
-      setVoiceState("error");
+      // A failed run must not leave the mic dead — hand the turn back to the
+      // user instead of parking the orb on "Something went wrong".
+      if (voiceActiveRef.current) {
+        setVoiceState("listening");
+        voice.resumeListening();
+      } else {
+        setVoiceState("error");
+      }
       setMessages((m) => [
         ...m,
         {
@@ -333,6 +353,7 @@ export function useConversationController() {
       await audio.play();
     } catch (err) {
       console.error("Speech playback failed:", err);
+      setVoiceError("Couldn't play the spoken reply — check your audio output.");
       backToListening();
     }
   }
@@ -362,11 +383,14 @@ export function useConversationController() {
       await voice.stop();
       setVoiceState("idle");
       setInterimTranscript("");
+      setMicLevel(0);
       return;
     }
     if (!conversationIdRef.current) return;
     voiceActiveRef.current = true;
     setVoiceError(null);
+    setVoiceWarning(null);
+    setMicLevel(0);
     setVoiceState("listening");
     await voice.start(conversationIdRef.current);
     // ConvoAI speaks its own greeting server-side (`greeting_message` on the
@@ -402,6 +426,9 @@ export function useConversationController() {
     decideApproval,
     outputDevices,
     outputDeviceId,
+    voiceMode,
+    voiceWarning,
+    micLevel,
     audioRef,
     isWorking,
     sendText,

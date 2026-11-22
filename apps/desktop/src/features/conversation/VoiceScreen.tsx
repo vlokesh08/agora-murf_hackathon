@@ -27,9 +27,13 @@ const statusLabels: Record<VoiceState, string> = {
 export function VoiceScreen() {
   const navigate = useNavigate();
   const {
+    messages,
     voiceState,
     interimTranscript,
     voiceError,
+    voiceMode,
+    voiceWarning,
+    micLevel,
     audioRef,
     toggleVoice,
     handleAudioEnded,
@@ -37,6 +41,12 @@ export function VoiceScreen() {
     approvalFeedback,
     decideApproval,
   } = useConversationController();
+
+  // The voice-only screen has no transcript, so a reply whose audio failed to
+  // play used to be completely invisible. Always show the latest one too.
+  const lastReply = [...messages].reverse().find((m) => m.role === "assistant")?.text;
+  const showMicMeter =
+    voiceMode === "hybrid" && (voiceState === "listening" || voiceState === "transcribing");
 
   return (
     <div className="relative flex h-screen flex-col items-center justify-center bg-[var(--color-bg)]">
@@ -49,14 +59,37 @@ export function VoiceScreen() {
         <X className="size-4" aria-hidden="true" />
       </button>
 
-      <div className="flex flex-col items-center gap-8">
+      <div className="flex max-h-full flex-col items-center gap-6 overflow-y-auto px-6 py-10">
         <VoiceOrb state={voiceState} onClick={toggleVoice} size="w-56" />
 
-        <div className="flex max-w-md flex-col items-center gap-2 px-6 text-center">
+        <div className="flex max-w-md flex-col items-center gap-2 text-center">
           <p className="text-sm font-medium text-[var(--color-text-dim)]">{statusLabels[voiceState]}</p>
+
+          {showMicMeter && (
+            <div className="flex w-40 items-center gap-2" aria-label="Microphone input level">
+              <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-[var(--color-surface-2)]">
+                <div
+                  className="h-full rounded-full bg-[var(--color-accent)] transition-[width] duration-100"
+                  style={{ width: `${Math.round(micLevel * 100)}%` }}
+                />
+              </div>
+              <span className="text-[10px] uppercase tracking-wide text-[var(--color-text-dim)]">mic</span>
+            </div>
+          )}
+
+          {voiceMode && (
+            <p className="text-[10px] uppercase tracking-wide text-[var(--color-text-dim)]">
+              {voiceMode === "convoai" ? "Agora agent" : "Local mic · Whisper"}
+            </p>
+          )}
+
           {interimTranscript && (
             <p className="text-base text-[var(--color-text)]">{interimTranscript}</p>
           )}
+          {lastReply && (
+            <p className="mt-1 line-clamp-4 text-sm text-[var(--color-text)]">{lastReply}</p>
+          )}
+          {voiceWarning && <p className="text-xs text-[var(--color-warning)]">{voiceWarning}</p>}
           {voiceError && <p className="text-sm text-[var(--color-danger)]">{voiceError}</p>}
         </div>
       </div>
